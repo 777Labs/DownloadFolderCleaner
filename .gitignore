@@ -1,0 +1,28 @@
+# Build & Output artifacts
+[Bb]in/
+[Oo]bj/
+publish/
+public/
+dist/
+out/
+target/
+build/
+*.spec
+
+# Python Virtual Environment & Cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Runtime Settings & Logs
+settings.json
+*.log
+*.tmp
+
+# IDE & OS files
+.vs/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
