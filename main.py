@@ -44,6 +44,7 @@ from send2trash import send2trash
 # -----------------------------
 APP_NAME = "Download Folder Cleaner"
 APP_VERSION = "1.0.0"
+APP_USER_MODEL_ID = "777Labs.DownloadFolderCleaner.1.0"
 MUTEX_NAME = "Local\\DownloadFolderCleaner_SingleInstance_Mutex_v1"
 SHOW_EVENT_NAME = "Local\\DownloadFolderCleaner_ShowSettings_Event_v1"
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1283,6 +1284,13 @@ class DownloadsCleanerApp:
         self.settings, self.is_first_launch = load_settings()
         self.action_queue: queue.Queue[str] = queue.Queue()
 
+        # Windows タスクバーアイコンを独立適用するため、Tk生成前に AppUserModelID を設定
+        if os.name == "nt":
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+            except Exception:
+                pass
+
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.configure(bg=COLOR_BG_ROOT)
@@ -1295,6 +1303,9 @@ class DownloadsCleanerApp:
         self._last_periodic_check: float = time.time()
         self._cleanup_lock = threading.Lock()
         self._header_icon_photo: ImageTk.PhotoImage | None = None
+        self._tk_icon_photos: list[ImageTk.PhotoImage] = []
+        self._win32_hicon_big: int | None = None
+        self._win32_hicon_small: int | None = None
 
         self._apply_window_icon()
         self._apply_saved_geometry()
@@ -1336,9 +1347,96 @@ class DownloadsCleanerApp:
         ico_path = get_resource_path(ICON_ICO_FILENAME)
         if ico_path.is_file():
             try:
+                self.root.iconbitmap(default=str(ico_path))
                 self.root.iconbitmap(str(ico_path))
             except Exception:
                 pass
+
+        png_path = get_resource_path(ICON_PNG_FILENAME)
+        if png_path.is_file() and not self._tk_icon_photos:
+            try:
+                base_img = Image.open(png_path).convert("RGBA")
+                for sz in (256, 64, 48, 32, 16):
+                    resized = base_img.resize((sz, sz), Image.Resampling.LANCZOS)
+                    self._tk_icon_photos.append(ImageTk.PhotoImage(resized))
+                if self._tk_icon_photos:
+                    self.root.iconphoto(True, *self._tk_icon_photos)
+            except Exception:
+                pass
+
+        self._apply_win32_window_icon()
+
+    def _apply_win32_window_icon(self) -> None:
+        """Win32 WM_SETICON / SetClassLongPtrW でタイトルバーとタスクバー双方へアイコンを確実に適用"""
+        if os.name != "nt":
+            return
+
+        ico_path = get_resource_path(ICON_ICO_FILENAME)
+        if not ico_path.is_file():
+            return
+
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            user32.LoadImageW.argtypes = [
+                wintypes.HINSTANCE,
+                wintypes.LPCWSTR,
+                wintypes.UINT,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.LoadImageW.restype = wintypes.HANDLE
+
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+            GCLP_HICON = -14
+            GCLP_HICONSM = -34
+
+            if not self._win32_hicon_big:
+                cx_big = max(48, user32.GetSystemMetrics(11))  # SM_CXICON
+                cy_big = max(48, user32.GetSystemMetrics(12))  # SM_CYICON
+                self._win32_hicon_big = user32.LoadImageW(
+                    None, str(ico_path), IMAGE_ICON, cx_big, cy_big, LR_LOADFROMFILE
+                )
+            if not self._win32_hicon_small:
+                cx_sm = max(16, user32.GetSystemMetrics(49))  # SM_CXSMICON
+                cy_sm = max(16, user32.GetSystemMetrics(50))  # SM_CYSMICON
+                self._win32_hicon_small = user32.LoadImageW(
+                    None, str(ico_path), IMAGE_ICON, cx_sm, cy_sm, LR_LOADFROMFILE
+                )
+
+            self.root.update_idletasks()
+            hwnd_inner = self.root.winfo_id()
+            hwnd = user32.GetParent(hwnd_inner) or hwnd_inner
+            if not hwnd:
+                return
+
+            set_class_long_ptr = getattr(user32, "SetClassLongPtrW", user32.SetClassLongW)
+            set_class_long_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            set_class_long_ptr.restype = ctypes.c_ssize_t
+
+            if self._win32_hicon_big:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, self._win32_hicon_big)
+                set_class_long_ptr(hwnd, GCLP_HICON, self._win32_hicon_big)
+            if self._win32_hicon_small:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, self._win32_hicon_small)
+                set_class_long_ptr(hwnd, GCLP_HICONSM, self._win32_hicon_small)
+        except Exception:
+            pass
 
     def _parse_geometry(self, geom_str: str) -> tuple[int, int] | None:
         """保存されたジオメトリ文字列から表示座標 (x, y) を抽出する（サイズは常に 940x825 固定）"""
@@ -1413,10 +1511,15 @@ class DownloadsCleanerApp:
                 pass
 
     def show_settings_window(self, first_launch_banner: bool = False) -> None:
+        if not self.var_downloads_path.get().strip():
+            self.var_downloads_path.set(self._get_auto_detected_downloads_str())
+
         self._apply_saved_geometry()
         self.root.deiconify()
         self.root.state("normal")
         self._is_window_visible = True
+        self._apply_win32_window_icon()
+        self.root.after(50, self._apply_win32_window_icon)
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.after(120, lambda: self.root.attributes("-topmost", False))
@@ -1708,7 +1811,7 @@ class DownloadsCleanerApp:
         row_path.pack(fill=tk.X, pady=4)
         tk.Label(
             row_path,
-            text="対象フォルダ (空欄=自動検出):",
+            text="対象フォルダ:",
             font=(FONT_FAMILY, 9),
             fg=COLOR_TEXT_BODY,
             bg=COLOR_BG_PANEL,
@@ -1729,7 +1832,7 @@ class DownloadsCleanerApp:
         ent_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, ipady=4)
 
         self._make_btn(row_path, "参照...", self._browse_downloads_dir, pady=3, padx=10).pack(side=tk.LEFT, padx=2)
-        self._make_btn(row_path, "自動検出", lambda: self.var_downloads_path.set(""), pady=3, padx=10).pack(
+        self._make_btn(row_path, "自動検出", self._reset_downloads_dir_auto, pady=3, padx=10).pack(
             side=tk.LEFT, padx=2
         )
 
@@ -2197,9 +2300,27 @@ class DownloadsCleanerApp:
     # -----------------------------
     # 設定のUI反映・収集
     # -----------------------------
+    def _get_auto_detected_downloads_str(self) -> str:
+        try:
+            return str(get_downloads_dir())
+        except FileNotFoundError:
+            return ""
+
+    def _reset_downloads_dir_auto(self) -> None:
+        detected = self._get_auto_detected_downloads_str()
+        self.var_downloads_path.set(detected)
+        if detected:
+            self.var_status.set(f"📂 対象フォルダを自動検出しました: {detected}")
+            self.refresh_downloads_list()
+        else:
+            self.var_status.set("⚠️ ダウンロードフォルダを自動検出できませんでした。参照ボタンから指定してください。")
+
     def _load_settings_into_ui(self) -> None:
         s = self.settings
-        self.var_downloads_path.set(str(s.get("downloads_path", "")))
+        dl_path = str(s.get("downloads_path", "")).strip()
+        if not dl_path:
+            dl_path = self._get_auto_detected_downloads_str()
+        self.var_downloads_path.set(dl_path)
         self.var_threshold_hours.set(str(s.get("threshold_hours", 24.0)))
         self.var_time_basis.set(str(s.get("time_basis", "max_mtime_ctime")))
         self.var_min_size_mb.set(str(s.get("min_size_mb", 0.0)))
@@ -2260,11 +2381,24 @@ class DownloadsCleanerApp:
             return False
 
         dl_path_str = self.var_downloads_path.get().strip()
+        auto_dl_str = self._get_auto_detected_downloads_str()
+        if not dl_path_str:
+            dl_path_str = auto_dl_str
+            self.var_downloads_path.set(dl_path_str)
+
+        saved_dl_path = dl_path_str
         if dl_path_str:
             p = Path(dl_path_str).expanduser()
             if not p.is_dir():
                 messagebox.showerror(APP_NAME, f"指定された対象フォルダが存在しません:\n{p}", parent=self.root)
                 return False
+            if auto_dl_str:
+                try:
+                    if p.resolve() == Path(auto_dl_str).resolve():
+                        # OS自動検出パスと一致する場合は自動検出設定として保持（他PC移行時も自動追従）
+                        saved_dl_path = ""
+                except OSError:
+                    pass
 
         ext_map: dict[str, float] = {}
         ext_raw = self.var_extension_hours.get().strip()
@@ -2298,7 +2432,7 @@ class DownloadsCleanerApp:
         self.settings.update(
             {
                 "initialized": True,
-                "downloads_path": dl_path_str,
+                "downloads_path": saved_dl_path,
                 "threshold_hours": hrs,
                 "time_basis": self.var_time_basis.get(),
                 "min_size_mb": min_mb,
@@ -2491,7 +2625,8 @@ class DownloadsCleanerApp:
 
     def open_downloads_folder(self) -> None:
         try:
-            dl = get_downloads_dir(self.settings.get("downloads_path", ""))
+            current_input = self.var_downloads_path.get().strip()
+            dl = get_downloads_dir(current_input or self.settings.get("downloads_path", ""))
             if os.name == "nt":
                 os.startfile(str(dl))
             else:
@@ -2609,6 +2744,17 @@ class DownloadsCleanerApp:
         self._persist_window_geometry()
         self.tray.stop()
         self.guard.close()
+        if os.name == "nt":
+            try:
+                user32 = ctypes.windll.user32
+                if self._win32_hicon_big:
+                    user32.DestroyIcon(self._win32_hicon_big)
+                    self._win32_hicon_big = None
+                if self._win32_hicon_small:
+                    user32.DestroyIcon(self._win32_hicon_small)
+                    self._win32_hicon_small = None
+            except Exception:
+                pass
         self.root.quit()
         self.root.destroy()
 
